@@ -115,6 +115,40 @@ where
         }
     }
 
+    async fn test_insert_with_default_value(&self) {
+        let catalog_manager = Arc::new(build_catalog_manager(self.engine()).await);
+        let ctx = Context::builder(RequestId::next_id())
+            .default_catalog_and_schema(DEFAULT_CATALOG.to_string(), DEFAULT_SCHEMA.to_string())
+            .build();
+        let insert_factory = Factory::new(ExecutorImpl::new(), catalog_manager.clone(), self.engine());
+        let insert_sql = "INSERT INTO test_table_with_default_value(key1, key2, field1, field2) VALUES('tagk', 1638428434000, 100, 200);";
+
+        let plan = sql_to_plan(&self.meta_provider, insert_sql);
+        let interpreter = insert_factory.create(ctx, plan);
+        let output = interpreter.execute().await.unwrap();
+        if let Output::AffectedRows(v) = output {
+            assert_eq!(v, 1);
+        } else {
+            panic!();
+        }
+
+        // select
+        let select_sql = "SELECT key1, key2, field1, field2, field3 from test_table_with_default_value";
+        let select_factory = Factory::new(ExecutorImpl::new(), catalog_manager, self.engine());
+        let ctx = Context::builder(RequestId::next_id())
+        .default_catalog_and_schema(DEFAULT_CATALOG.to_string(), DEFAULT_SCHEMA.to_string())
+        .build();
+        let plan = sql_to_plan(&self.meta_provider, select_sql);
+        let interpreter = select_factory.create(ctx, plan);
+        let output = interpreter.execute().await.unwrap();
+        if let Output::Records(v) = output {
+            println!("{:?}", v);
+        } else {
+            panic!();
+        }
+       
+    }
+
     async fn test_select_table(&self) {
         let sql = "select * from test_table";
         let output = self.sql_to_output(sql).await.unwrap();
@@ -193,12 +227,15 @@ where
         meta_provider: mock,
     };
 
-    env.test_create_table().await;
-    env.test_desc_table().await;
-    env.test_exists_table().await;
-    env.test_insert_table().await;
-    env.test_select_table().await;
-    env.test_show_create_table().await;
-    env.test_alter_table().await;
-    env.test_drop_table().await;
+    // env.test_create_table().await;
+    // env.test_desc_table().await;
+    // env.test_exists_table().await;
+    // env.test_insert_table().await;
+    // env.test_select_table().await;
+    // env.test_show_create_table().await;
+    // env.test_alter_table().await;
+    // env.test_drop_table().await;
+
+    // default value test
+    env.test_insert_with_default_value().await;
 }

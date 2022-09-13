@@ -121,6 +121,8 @@ pub struct InsertPlan {
     pub table: TableRef,
     /// RowGroup to insert
     pub rows: RowGroup,
+    /// Column idxes in schema which need be filled via default-value-expr
+    pub need_fill_column_idxes: Vec<usize>,
 }
 
 #[derive(Debug)]

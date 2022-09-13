@@ -4,7 +4,10 @@
 
 use std::{collections::BTreeMap, convert::TryFrom, str::FromStr};
 
-use arrow_deps::arrow::datatypes::{DataType, Field};
+use arrow_deps::{
+    arrow::datatypes::{DataType, Field},
+    datafusion_expr::Expr as LogicalExpr,
+};
 use proto::common as common_pb;
 use snafu::{ensure, Backtrace, OptionExt, ResultExt, Snafu};
 
@@ -133,7 +136,7 @@ impl ToString for ArrowFieldMetaKey {
 }
 
 /// Schema of column
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ColumnSchema {
     /// Id of column
     pub id: ColumnId,
@@ -150,6 +153,8 @@ pub struct ColumnSchema {
     pub comment: String,
     /// Column name in response
     pub escaped_name: String,
+    /// Default value expr
+    pub default_value: Option<LogicalExpr>,
 }
 
 impl ColumnSchema {
@@ -261,6 +266,7 @@ impl From<common_pb::ColumnSchema> for ColumnSchema {
             is_tag: column_schema.is_tag,
             comment: column_schema.comment,
             escaped_name,
+            default_value: None,
         }
     }
 }
@@ -290,6 +296,7 @@ impl TryFrom<&Field> for ColumnSchema {
             is_tag,
             comment,
             escaped_name: field.name().escape_debug().to_string(),
+            default_value: None,
         })
     }
 }
@@ -357,6 +364,7 @@ pub struct Builder {
     is_nullable: bool,
     is_tag: bool,
     comment: String,
+    default_value: Option<LogicalExpr>,
 }
 
 impl Builder {
@@ -369,6 +377,7 @@ impl Builder {
             is_nullable: false,
             is_tag: false,
             comment: String::new(),
+            default_value: None,
         }
     }
 
@@ -391,6 +400,11 @@ impl Builder {
 
     pub fn comment(mut self, comment: String) -> Self {
         self.comment = comment;
+        self
+    }
+
+    pub fn default_value(mut self, default_value: Option<LogicalExpr>) -> Self {
+        self.default_value = default_value;
         self
     }
 
@@ -418,6 +432,7 @@ impl Builder {
             is_tag: self.is_tag,
             comment: self.comment,
             escaped_name,
+            default_value: self.default_value,
         })
     }
 }
@@ -449,6 +464,7 @@ mod tests {
             is_tag: true,
             comment: "Comment of this column".to_string(),
             escaped_name: "test_column_schema".escape_debug().to_string(),
+            default_value: None,
         };
 
         assert_eq!(&lhs, &rhs);

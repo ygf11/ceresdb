@@ -108,6 +108,9 @@ impl Manager for TableBasedManager {
     }
 
     fn catalog_by_name(&self, name: NameRef) -> manager::Result<Option<CatalogRef>> {
+        for (name, catalog) in self.catalogs.iter() {
+            println!("Catalog, name:{:?}", name);
+        }
         let catalog = self.catalogs.get(name).cloned().map(|v| v as _);
         Ok(catalog)
     }

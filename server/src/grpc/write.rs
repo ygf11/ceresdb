@@ -262,6 +262,8 @@ fn write_metric_to_insert_plan(
     Ok(InsertPlan {
         table,
         rows: row_group,
+        need_fill_column_idxes: vec![],
+
     })
 }
 
@@ -505,6 +507,7 @@ mod test {
                 is_tag: false,
                 comment: String::new(),
                 escaped_name: TIMESTAMP_COLUMN_NAME.escape_debug().to_string(),
+                default_value: None,
             })
             .unwrap()
             .add_key_column(ColumnSchema {
@@ -515,6 +518,7 @@ mod test {
                 is_tag: true,
                 comment: String::new(),
                 escaped_name: TAG_K.escape_debug().to_string(),
+                default_value: None,
             })
             .unwrap()
             .add_normal_column(ColumnSchema {
@@ -525,6 +529,7 @@ mod test {
                 is_tag: true,
                 comment: String::new(),
                 escaped_name: TAG_K1.escape_debug().to_string(),
+                default_value: None,
             })
             .unwrap()
             .add_normal_column(ColumnSchema {
@@ -535,6 +540,7 @@ mod test {
                 is_tag: false,
                 comment: String::new(),
                 escaped_name: FIELD_NAME.escape_debug().to_string(),
+                default_value: None,
             })
             .unwrap()
             .add_normal_column(ColumnSchema {
@@ -545,6 +551,7 @@ mod test {
                 is_tag: false,
                 comment: String::new(),
                 escaped_name: FIELD_NAME1.escape_debug().to_string(),
+                default_value: None,
             })
             .unwrap()
             .build()

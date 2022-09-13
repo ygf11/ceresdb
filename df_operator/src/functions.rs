@@ -67,6 +67,11 @@ impl ScalarValue {
             _ => None,
         }
     }
+
+    /// TODO(ygf11): changing inner value to datum can make simple. 
+    pub fn as_df_scalar_value(&self) -> &DfScalarValue {
+        &self.0
+    }
 }
 
 impl From<String> for ScalarValue {
@@ -123,7 +128,7 @@ impl ColumnarValue {
         }
     }
 
-    fn try_from_df_columnar_value(df_value: &DfColumnarValue) -> Result<Self> {
+    pub fn try_from_df_columnar_value(df_value: &DfColumnarValue) -> Result<Self> {
         let columnar_value = match df_value {
             DfColumnarValue::Array(array) => {
                 let column_block =

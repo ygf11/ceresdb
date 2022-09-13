@@ -9,7 +9,14 @@ use std::{
     sync::Arc,
 };
 
-use arrow_deps::datafusion::{error::DataFusionError, sql::planner::SqlToRel};
+use arrow_deps::{
+    arrow::datatypes::Field,
+    datafusion::{
+        common::{DFField, DFSchema},
+        error::DataFusionError,
+        sql::planner::SqlToRel,
+    },
+};
 use common_types::{
     column_schema::{self, ColumnSchema},
     datum::{Datum, DatumKind},
@@ -17,6 +24,7 @@ use common_types::{
     row::{RowGroup, RowGroupBuilder},
     schema::{self, Schema, TSID_COLUMN},
 };
+use hashbrown::HashMap as CteHashMap;
 use log::debug;
 use snafu::{ensure, Backtrace, OptionExt, ResultExt, Snafu};
 use sqlparser::ast::{
@@ -283,8 +291,39 @@ impl<'a, P: MetaProvider> PlannerDelegate<'a, P> {
 
         // Build all column schemas.
         for col in &stmt.columns {
-            name_column_map.insert(col.name.value.as_str(), parse_column(col)?);
+            let name = col.name.value.as_str();
+            name_column_map.insert(name, (parse_column(col)?, parse_default_value(col)?));
         }
+
+        // Analyze default value exprs.
+        let df_planner = SqlToRel::new(&self.meta_provider);
+        let df_fields = name_column_map
+            .iter()
+            .map(|(name, (column_def, _))| {
+                DFField::new(
+                    None,
+                    name,
+                    column_def.data_type.to_arrow_data_type(),
+                    column_def.is_nullable,
+                )
+            })
+            .collect::<Vec<_>>();
+        let df_schema = DFSchema::new_with_metadata(df_fields, HashMap::new()).unwrap();
+
+        // TODO(ygf11): check circle depends in exprs.
+        for (_, (column_def, default_value)) in name_column_map.iter_mut() {
+            if let Some(expr) = default_value {
+                let expr = df_planner
+                    .sql_to_rex(expr.clone(), &df_schema, &mut CteHashMap::new())
+                    .unwrap();
+                column_def.default_value = Some(expr);
+            }
+        }
+
+        debug!(
+            "Create table to plan, name_column_map:{:?}",
+            name_column_map
+        );
 
         // Tsid column is a reserved column.
         ensure!(
@@ -313,7 +352,7 @@ impl<'a, P: MetaProvider> PlannerDelegate<'a, P> {
                     ensure!(columns.len() == 1, InvalidTimetampKey);
 
                     let name = &columns[0].value;
-                    let timestamp_column = name_column_map
+                    let (timestamp_column, _) = name_column_map
                         .get(name as &str)
                         .context(TimestampColumnNotFound { name })?;
                     // Ensure type is timestamp
@@ -335,11 +374,12 @@ impl<'a, P: MetaProvider> PlannerDelegate<'a, P> {
             // If primary key is already provided, use that primary key.
             if let TableConstraint::Unique { columns, .. } = &stmt.constraints[idx] {
                 for col in columns {
-                    let key_column = name_column_map.remove(&*col.value).with_context(|| {
-                        PrimaryKeyNotFound {
-                            name: col.value.clone(),
-                        }
-                    })?;
+                    let (key_column, _) =
+                        name_column_map.remove(&*col.value).with_context(|| {
+                            PrimaryKeyNotFound {
+                                name: col.value.clone(),
+                            }
+                        })?;
                     // The schema builder will checks there is only one timestamp column in primary
                     // key.
                     schema_builder = schema_builder
@@ -349,7 +389,7 @@ impl<'a, P: MetaProvider> PlannerDelegate<'a, P> {
             }
         } else {
             // If primary key is not set, Use (timestamp, tsid) as primary key.
-            let timestamp_column = name_column_map.remove(timestamp_name.as_str()).context(
+            let (timestamp_column, _) = name_column_map.remove(timestamp_name.as_str()).context(
                 TimestampColumnNotFound {
                     name: &timestamp_name,
                 },
@@ -370,7 +410,7 @@ impl<'a, P: MetaProvider> PlannerDelegate<'a, P> {
         }
 
         // The key columns have been consumed.
-        for col in name_column_map.into_values() {
+        for (col, _) in name_column_map.into_values() {
             schema_builder = schema_builder
                 .add_normal_column(col)
                 .context(BuildTableSchema)?;
@@ -436,6 +476,7 @@ impl<'a, P: MetaProvider> PlannerDelegate<'a, P> {
                     InsertDuplicateColumns
                 );
 
+                println!("{:?}", column_names_idx);
                 validate_insert_stmt(table.name(), &schema, &column_names_idx)?;
 
                 // Index in insert values stmt of each column in table schema
@@ -458,7 +499,9 @@ impl<'a, P: MetaProvider> PlannerDelegate<'a, P> {
                         }
                         None => {
                             // This column in schema is not in insert stmt
-                            if column.is_nullable {
+                            if column.default_value.is_some() {
+                                column_index_in_insert.push(InsertMode::Auto);
+                            } else if column.is_nullable {
                                 column_index_in_insert.push(InsertMode::Null);
                             } else {
                                 // Column is not null and input does not contains that column
@@ -472,9 +515,19 @@ impl<'a, P: MetaProvider> PlannerDelegate<'a, P> {
                     }
                 }
 
-                let rows = build_row_group(schema, source, column_index_in_insert)?;
+                let rows = build_row_group(schema, source, &column_index_in_insert)?;
+                let need_fill_column_idxes = column_index_in_insert
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, insert_mode)| matches!(insert_mode, InsertMode::Auto))
+                    .map(|(idx, _)| idx)
+                    .collect::<Vec<_>>();
 
-                Ok(Plan::Insert(InsertPlan { table, rows }))
+                Ok(Plan::Insert(InsertPlan {
+                    table,
+                    rows,
+                    need_fill_column_idxes,
+                }))
             }
             // We already known this stmt is a INSERT stmt
             _ => unreachable!(),
@@ -589,7 +642,7 @@ fn parse_data_value_from_expr(data_type: DatumKind, expr: &mut Expr) -> Result<D
 fn build_row_group(
     schema: Schema,
     source: Box<Query>,
-    column_index_in_insert: Vec<InsertMode>,
+    column_index_in_insert: &[InsertMode],
 ) -> Result<RowGroup> {
     // Build row group by schema
     match *source.body {
@@ -748,6 +801,17 @@ fn parse_column(col: &ColumnDef) -> Result<ColumnSchema> {
     })
 }
 
+fn parse_default_value(col: &ColumnDef) -> Result<Option<Expr>> {
+    let mut default_value = None;
+    for option_def in &col.options {
+        if let Some(expr) = parser::get_default_value(&option_def.option) {
+            default_value = Some(expr);
+        }
+    }
+
+    Ok(default_value)
+}
+
 #[cfg(test)]
 mod tests {
     use sqlparser::ast::{Ident, Value};
@@ -765,6 +829,7 @@ mod tests {
         let mut statements = Parser::parse_sql(sql).unwrap();
         assert_eq!(statements.len(), 1);
         let plan = planner.statement_to_plan(statements.remove(0))?;
+        println!("{:#?}", plan);
         assert_eq!(format!("{:#?}", plan), expected);
         Ok(())
     }
@@ -852,6 +917,7 @@ mod tests {
                         is_tag: true,
                         comment: "",
                         escaped_name: "c1",
+                        default_value: None,
                     },
                     ColumnSchema {
                         id: 2,
@@ -861,6 +927,7 @@ mod tests {
                         is_tag: false,
                         comment: "",
                         escaped_name: "ts",
+                        default_value: None,
                     },
                     ColumnSchema {
                         id: 3,
@@ -870,6 +937,7 @@ mod tests {
                         is_tag: false,
                         comment: "",
                         escaped_name: "c3",
+                        default_value: None,
                     },
                 ],
             },
@@ -930,6 +998,7 @@ mod tests {
                             is_tag: false,
                             comment: "",
                             escaped_name: "key1",
+                            default_value: None,
                         },
                         ColumnSchema {
                             id: 2,
@@ -939,6 +1008,7 @@ mod tests {
                             is_tag: false,
                             comment: "",
                             escaped_name: "key2",
+                            default_value: None,
                         },
                         ColumnSchema {
                             id: 3,
@@ -948,6 +1018,7 @@ mod tests {
                             is_tag: false,
                             comment: "",
                             escaped_name: "field1",
+                            default_value: None,
                         },
                         ColumnSchema {
                             id: 4,
@@ -957,6 +1028,7 @@ mod tests {
                             is_tag: false,
                             comment: "",
                             escaped_name: "field2",
+                            default_value: None,
                         },
                     ],
                 },
@@ -979,6 +1051,7 @@ mod tests {
                             is_tag: false,
                             comment: "",
                             escaped_name: "key1",
+                            default_value: None,
                         },
                         ColumnSchema {
                             id: 2,
@@ -988,6 +1061,7 @@ mod tests {
                             is_tag: false,
                             comment: "",
                             escaped_name: "key2",
+                            default_value: None,
                         },
                         ColumnSchema {
                             id: 3,
@@ -997,6 +1071,7 @@ mod tests {
                             is_tag: false,
                             comment: "",
                             escaped_name: "field1",
+                            default_value: None,
                         },
                         ColumnSchema {
                             id: 4,
@@ -1006,6 +1081,7 @@ mod tests {
                             is_tag: false,
                             comment: "",
                             escaped_name: "field2",
+                            default_value: None,
                         },
                     ],
                 },
@@ -1040,6 +1116,7 @@ mod tests {
                 1638428434000,
             ),
         },
+        need_fill_column_idxes: [],
     },
 )"#,
         )
@@ -1108,6 +1185,7 @@ mod tests {
                             is_tag: false,
                             comment: "",
                             escaped_name: "key1",
+                            default_value: None,
                         },
                         ColumnSchema {
                             id: 2,
@@ -1117,6 +1195,7 @@ mod tests {
                             is_tag: false,
                             comment: "",
                             escaped_name: "key2",
+                            default_value: None,
                         },
                         ColumnSchema {
                             id: 3,
@@ -1126,6 +1205,7 @@ mod tests {
                             is_tag: false,
                             comment: "",
                             escaped_name: "field1",
+                            default_value: None,
                         },
                         ColumnSchema {
                             id: 4,
@@ -1135,6 +1215,7 @@ mod tests {
                             is_tag: false,
                             comment: "",
                             escaped_name: "field2",
+                            default_value: None,
                         },
                     ],
                 },
@@ -1177,6 +1258,7 @@ mod tests {
                             is_tag: false,
                             comment: "",
                             escaped_name: "key1",
+                            default_value: None,
                         },
                         ColumnSchema {
                             id: 2,
@@ -1186,6 +1268,7 @@ mod tests {
                             is_tag: false,
                             comment: "",
                             escaped_name: "key2",
+                            default_value: None,
                         },
                         ColumnSchema {
                             id: 3,
@@ -1195,6 +1278,7 @@ mod tests {
                             is_tag: false,
                             comment: "",
                             escaped_name: "field1",
+                            default_value: None,
                         },
                         ColumnSchema {
                             id: 4,
@@ -1204,6 +1288,7 @@ mod tests {
                             is_tag: false,
                             comment: "",
                             escaped_name: "field2",
+                            default_value: None,
                         },
                     ],
                 },
@@ -1220,6 +1305,7 @@ mod tests {
                     is_tag: false,
                     comment: "",
                     escaped_name: "add_col",
+                    default_value: None,
                 },
             ],
         ),
@@ -1259,6 +1345,7 @@ mod tests {
                             is_tag: false,
                             comment: "",
                             escaped_name: "key1",
+                            default_value: None,
                         },
                         ColumnSchema {
                             id: 2,
@@ -1268,6 +1355,7 @@ mod tests {
                             is_tag: false,
                             comment: "",
                             escaped_name: "key2",
+                            default_value: None,
                         },
                         ColumnSchema {
                             id: 3,
@@ -1277,6 +1365,7 @@ mod tests {
                             is_tag: false,
                             comment: "",
                             escaped_name: "field1",
+                            default_value: None,
                         },
                         ColumnSchema {
                             id: 4,
@@ -1286,6 +1375,7 @@ mod tests {
                             is_tag: false,
                             comment: "",
                             escaped_name: "field2",
+                            default_value: None,
                         },
                     ],
                 },
@@ -1334,6 +1424,7 @@ mod tests {
                                 is_tag: false,
                                 comment: "",
                                 escaped_name: "key1",
+                                default_value: None,
                             },
                             ColumnSchema {
                                 id: 2,
@@ -1343,6 +1434,7 @@ mod tests {
                                 is_tag: false,
                                 comment: "",
                                 escaped_name: "key2",
+                                default_value: None,
                             },
                             ColumnSchema {
                                 id: 3,
@@ -1352,6 +1444,7 @@ mod tests {
                                 is_tag: false,
                                 comment: "",
                                 escaped_name: "field1",
+                                default_value: None,
                             },
                             ColumnSchema {
                                 id: 4,
@@ -1361,6 +1454,7 @@ mod tests {
                                 is_tag: false,
                                 comment: "",
                                 escaped_name: "field2",
+                                default_value: None,
                             },
                         ],
                     },
@@ -1441,5 +1535,255 @@ mod tests {
                 .expect("Fail to parse data value");
             assert_eq!(parsed, expect);
         }
+    }
+
+    #[test]
+    fn test_create_table_statement_to_plan_with_default_value() {
+        let sql = "CREATE TABLE IF NOT EXISTS t(c1 uint32 tag not null DEFAULT 0,ts timestamp not null, c3 uint32 DEFAULT c1, timestamp key(ts),primary key(c1, ts)) \
+        ENGINE=Analytic WITH (ttl='70d',update_mode='overwrite',arena_block_size='1KB')";
+        quick_test(
+            sql,
+            r#"Create(
+    CreateTablePlan {
+        engine: "Analytic",
+        if_not_exists: true,
+        table: "t",
+        table_schema: Schema {
+            num_key_columns: 2,
+            timestamp_index: 1,
+            tsid_index: None,
+            enable_tsid_primary_key: false,
+            column_schemas: ColumnSchemas {
+                columns: [
+                    ColumnSchema {
+                        id: 1,
+                        name: "c1",
+                        data_type: UInt32,
+                        is_nullable: false,
+                        is_tag: true,
+                        comment: "",
+                        escaped_name: "c1",
+                        default_value: Some(
+                            Int64(0),
+                        ),
+                    },
+                    ColumnSchema {
+                        id: 2,
+                        name: "ts",
+                        data_type: Timestamp,
+                        is_nullable: false,
+                        is_tag: false,
+                        comment: "",
+                        escaped_name: "ts",
+                        default_value: None,
+                    },
+                    ColumnSchema {
+                        id: 3,
+                        name: "c3",
+                        data_type: UInt32,
+                        is_nullable: true,
+                        is_tag: false,
+                        comment: "",
+                        escaped_name: "c3",
+                        default_value: Some(
+                            #c1,
+                        ),
+                    },
+                ],
+            },
+            version: 1,
+        },
+        options: {
+            "arena_block_size": "1KB",
+            "ttl": "70d",
+            "update_mode": "overwrite",
+        },
+    },
+)"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_insert_statement_to_plan_with_default_value() {
+        let sql = "INSERT INTO test_table_with_default_value(key1, key2, field1, field2) VALUES('tagk', 1638428434000, 100, 200);";
+        quick_test(
+            sql,
+            r#"Insert(
+    InsertPlan {
+        table: MemoryTable {
+            name: "test_table_with_default_value",
+            id: TableId(
+                102,
+            ),
+            schema: Schema {
+                num_key_columns: 2,
+                timestamp_index: 1,
+                tsid_index: None,
+                enable_tsid_primary_key: false,
+                column_schemas: ColumnSchemas {
+                    columns: [
+                        ColumnSchema {
+                            id: 1,
+                            name: "key1",
+                            data_type: Varbinary,
+                            is_nullable: false,
+                            is_tag: false,
+                            comment: "",
+                            escaped_name: "key1",
+                            default_value: None,
+                        },
+                        ColumnSchema {
+                            id: 2,
+                            name: "key2",
+                            data_type: Timestamp,
+                            is_nullable: false,
+                            is_tag: false,
+                            comment: "",
+                            escaped_name: "key2",
+                            default_value: None,
+                        },
+                        ColumnSchema {
+                            id: 3,
+                            name: "field1",
+                            data_type: UInt32,
+                            is_nullable: false,
+                            is_tag: false,
+                            comment: "",
+                            escaped_name: "field1",
+                            default_value: None,
+                        },
+                        ColumnSchema {
+                            id: 4,
+                            name: "field2",
+                            data_type: UInt32,
+                            is_nullable: false,
+                            is_tag: false,
+                            comment: "",
+                            escaped_name: "field2",
+                            default_value: Some(
+                                UInt32(0),
+                            ),
+                        },
+                        ColumnSchema {
+                            id: 5,
+                            name: "field3",
+                            data_type: UInt32,
+                            is_nullable: false,
+                            is_tag: false,
+                            comment: "",
+                            escaped_name: "field3",
+                            default_value: Some(
+                                #field1,
+                            ),
+                        },
+                    ],
+                },
+                version: 1,
+            },
+        },
+        rows: RowGroup {
+            schema: Schema {
+                num_key_columns: 2,
+                timestamp_index: 1,
+                tsid_index: None,
+                enable_tsid_primary_key: false,
+                column_schemas: ColumnSchemas {
+                    columns: [
+                        ColumnSchema {
+                            id: 1,
+                            name: "key1",
+                            data_type: Varbinary,
+                            is_nullable: false,
+                            is_tag: false,
+                            comment: "",
+                            escaped_name: "key1",
+                            default_value: None,
+                        },
+                        ColumnSchema {
+                            id: 2,
+                            name: "key2",
+                            data_type: Timestamp,
+                            is_nullable: false,
+                            is_tag: false,
+                            comment: "",
+                            escaped_name: "key2",
+                            default_value: None,
+                        },
+                        ColumnSchema {
+                            id: 3,
+                            name: "field1",
+                            data_type: UInt32,
+                            is_nullable: false,
+                            is_tag: false,
+                            comment: "",
+                            escaped_name: "field1",
+                            default_value: None,
+                        },
+                        ColumnSchema {
+                            id: 4,
+                            name: "field2",
+                            data_type: UInt32,
+                            is_nullable: false,
+                            is_tag: false,
+                            comment: "",
+                            escaped_name: "field2",
+                            default_value: Some(
+                                UInt32(0),
+                            ),
+                        },
+                        ColumnSchema {
+                            id: 5,
+                            name: "field3",
+                            data_type: UInt32,
+                            is_nullable: false,
+                            is_tag: false,
+                            comment: "",
+                            escaped_name: "field3",
+                            default_value: Some(
+                                #field1,
+                            ),
+                        },
+                    ],
+                },
+                version: 1,
+            },
+            rows: [
+                Row {
+                    cols: [
+                        Varbinary(
+                            b"tagk",
+                        ),
+                        Timestamp(
+                            Timestamp(
+                                1638428434000,
+                            ),
+                        ),
+                        UInt32(
+                            100,
+                        ),
+                        UInt32(
+                            200,
+                        ),
+                        UInt32(
+                            0,
+                        ),
+                    ],
+                },
+            ],
+            min_timestamp: Timestamp(
+                1638428434000,
+            ),
+            max_timestamp: Timestamp(
+                1638428434000,
+            ),
+        },
+        need_fill_column_idxes: [
+            4,
+        ],
+    },
+)"#,
+        )
+        .unwrap();
     }
 }

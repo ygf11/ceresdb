@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use arrow_deps::datafusion::catalog::TableReference;
 use catalog::consts::{DEFAULT_CATALOG, DEFAULT_SCHEMA};
-use common_types::tests::build_schema;
+use common_types::tests::{build_schema, build_default_value_schema};
 use df_operator::{scalar::ScalarUdf, udaf::AggregateUdf};
 use table_engine::{
     memory::MemoryTable,
@@ -34,6 +34,12 @@ impl Default for MockMetaProvider {
                     build_schema(),
                     ANALYTIC_ENGINE_TYPE.to_string(),
                 )),
+                Arc::new(MemoryTable::new(
+                    "test_table_with_default_value".to_string(),
+                    TableId::from(102),
+                    build_default_value_schema(),
+                    ANALYTIC_ENGINE_TYPE.to_string(),
+                )),
             ],
         }
     }
@@ -50,6 +56,10 @@ impl MetaProvider for MockMetaProvider {
 
     fn table(&self, name: TableReference) -> crate::provider::Result<Option<TableRef>> {
         let resolved = name.resolve(self.default_catalog_name(), self.default_schema_name());
+        println!(
+            "MetaProvider, catalog:{:?}, schema:{:?}, table:{:?}",
+            resolved.catalog, resolved.schema, resolved.table
+        );
         for table in &self.tables {
             if resolved.table == table.name() {
                 return Ok(Some(table.clone()));
