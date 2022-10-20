@@ -14,7 +14,7 @@ use common_types::{
     SequenceNumber,
 };
 use common_util::codec::row;
-use log::trace;
+use log::{trace, debug};
 use skiplist::{ArenaSlice, IterRef, Skiplist};
 use snafu::ResultExt;
 
@@ -77,6 +77,8 @@ impl<A: Arena<Stats = BasicStats> + Clone + Sync + Send> ColumnarIterImpl<A> {
             .projected_schema
             .try_project_with_key(&memtable.schema)
             .context(ProjectSchema)?;
+
+        debug!("projector:{:#?}", projector);    
 
         let iter = memtable.skiplist.iter();
         let mut columnar_iter = Self {

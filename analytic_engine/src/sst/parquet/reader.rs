@@ -171,6 +171,7 @@ impl<'a> ParquetSstReader<'a> {
             .try_project_with_key(&schema)
             .map_err(|e| Box::new(e) as _)
             .context(Projection)?;
+
         let predicate = self.predicate.clone();
         let reverse = self.reverse;
 

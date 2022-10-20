@@ -1,13 +1,20 @@
 // Copyright 2022 CeresDB Project Authors. Licensed under Apache-2.0.
 
-use std::ops::Bound;
+use std::{ops::Bound, sync::Arc};
 
+use arrow::array::BooleanArray;
 use common_types::{
     projected_schema::ProjectedSchema, record_batch::RecordBatchWithKey, SequenceNumber,
 };
 use common_util::define_result;
+use datafusion::{
+    error::DataFusionError,
+    logical_plan::{combine_filters, ToDFSchema},
+    physical_expr::{create_physical_expr, execution_props::ExecutionProps},
+    physical_plan::PhysicalExpr,
+};
 use futures::stream::{self, Stream, StreamExt};
-use log::{error, trace};
+use log::{error, info, trace};
 use object_store::ObjectStoreRef;
 use snafu::{Backtrace, OptionExt, ResultExt, Snafu};
 use table_engine::{
@@ -77,6 +84,29 @@ pub type SequencedRecordBatchStream = Box<
         + Unpin,
 >;
 
+fn filter_batch(
+    mut sequenced_record_batch: SequencedRecordBatch,
+    predicate: Arc<dyn PhysicalExpr>,
+) -> Option<SequencedRecordBatch> {
+    // 报错了 要插类型转换
+    info!("filter batch, batch:{:?}", sequenced_record_batch.record_batch.as_arrow_record_batch());
+    // info!("filter batch, batch:{:?}", sequenced_record_batch.record_batch.as_arrow_record_batch().column(0));
+    // info!("filter batch, batch:{:?}", sequenced_record_batch.record_batch.as_arrow_record_batch().column(1));
+    let filter_array = predicate
+        .evaluate(sequenced_record_batch.record_batch.as_arrow_record_batch())
+        .map(|v| v.into_array(sequenced_record_batch.num_rows()))
+        .unwrap();
+    let filtered_array = filter_array
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .unwrap();
+
+    sequenced_record_batch
+        .record_batch
+        .select_data_v2(filtered_array);
+    Some(sequenced_record_batch)
+}
+
 /// Filter the `sequenced_record_batch` according to the `filter` if necessary.
 /// Returns the original batch if only a small proportion of the batch is
 /// filtered out.
@@ -137,16 +167,32 @@ fn maybe_filter_record_batch(
 pub fn filter_stream(
     origin_stream: SequencedRecordBatchStream,
     predicate: &Predicate,
+    projected_schema: ProjectedSchema,
 ) -> SequencedRecordBatchStream {
+    info!("111111111111111111111111111111111111111111111111111111111111111111111111111111111");
+    info!("filter record batch, predicate:{:?}", predicate,);
     if predicate.exprs().is_empty() {
         return origin_stream;
     }
 
-    let mut select_row_buf = Vec::new();
-    let filter = RecordBatchFilter::from(predicate.exprs());
+    let filter = combine_filters(predicate.exprs());
+    let input_schema = projected_schema.to_projected_arrow_schema();
+    let input_df_schema = input_schema.clone().to_dfschema().unwrap();
+    let execution_props = ExecutionProps::new();
+    let predicate = create_physical_expr(
+        &filter.unwrap(),
+        &input_df_schema,
+        input_schema.as_ref(),
+        &execution_props,
+    )
+    .unwrap();
+    info!("filter record batch, physical_expr:{:#?}, projected_schema:{:#?}", predicate, projected_schema.to_projected_arrow_schema());
+    info!("filter record batch, physical_expr:{:#?}, schema:{:#?}", predicate, projected_schema.to_record_schema().to_arrow_schema_ref());
+
     let stream = origin_stream.filter_map(move |sequence_record_batch| {
         let v = match sequence_record_batch {
-            Ok(v) => maybe_filter_record_batch(v, &filter, &mut select_row_buf).map(Ok),
+            Ok(v) => filter_batch(v, predicate.clone()).map(Ok),
+            // Ok(v) => maybe_filter_record_batch(v, &filter, &mut select_row_buf).map(Ok),
             Err(e) => Some(Err(e)),
         };
 
@@ -165,8 +211,8 @@ pub fn filtered_stream_from_memtable(
     reverse: bool,
     predicate: &Predicate,
 ) -> Result<SequencedRecordBatchStream> {
-    stream_from_memtable(projected_schema, need_dedup, memtable, reverse)
-        .map(|origin_stream| filter_stream(origin_stream, predicate))
+    stream_from_memtable(projected_schema.clone(), need_dedup, memtable, reverse)
+        .map(|origin_stream| filter_stream(origin_stream, predicate, projected_schema))
 }
 
 /// Build [SequencedRecordBatchStream] from a memtable.
@@ -218,7 +264,13 @@ pub async fn filtered_stream_from_sst_file(
         store,
     )
     .await
-    .map(|origin_stream| filter_stream(origin_stream, sst_reader_options.predicate.as_ref()))
+    .map(|origin_stream| {
+        filter_stream(
+            origin_stream,
+            sst_reader_options.predicate.as_ref(),
+            sst_reader_options.projected_schema.clone(),
+        )
+    })
 }
 
 /// Build the [SequencedRecordBatchStream] from a sst.

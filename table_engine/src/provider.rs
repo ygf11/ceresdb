@@ -82,6 +82,8 @@ impl TableProviderAdapter {
             read_order,
         );
 
+        debug!("scan table, schema:{:?}", TableProvider::schema(self));
+
         // Forbid the parallel reading if the data order is required.
         let read_parallelism = if read_order.is_in_order() {
             1
@@ -89,6 +91,7 @@ impl TableProviderAdapter {
             self.read_parallelism
         };
 
+        println!("filters: {:?}", filters);
         let predicate = self.predicate_from_filters(filters);
         let scan_table = Arc::new(ScanTable {
             projected_schema: ProjectedSchema::new(self.read_schema.clone(), projection.clone())

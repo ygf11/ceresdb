@@ -13,6 +13,7 @@ use crate::{
     schema::{ArrowSchemaRef, RecordSchema, RecordSchemaWithKey, Schema},
 };
 
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
